@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Imu
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from mavros_msgs.msg import AttitudeTarget
+from geometry_msgs.msg import Quaternion
+from mavros_msgs.srv import CommandTOL
+from mavros_msgs.srv import SetMode
+from mavros_msgs.srv import CommandBool
+from nav_msgs.msg import Odometry
+from tf_transformations import quaternion_from_euler,euler_from_quaternion,quaternion_matrix
+
+from PID_Controller import PIDController
+import csv
+import math
+import numpy as np
+
+
+class PIDControlNode(Node):
+    def __init__(self):
+        super().__init__("pid_controller")
+
+        # Create service clients
+        #self.takeoff_client = self.create_client(CommandTOL, 'mavros/cmd/takeoff')
+        self.set_mode_client = self.create_client(SetMode, 'mavros/set_mode')
+        #self.arming_client = self.create_client(CommandBool, 'mavros/cmd/arming')
+
+        # Wait for the services to be available
+        #self.takeoff_client.wait_for_service()
+        self.set_mode_client.wait_for_service()
+        #self.arming_client.wait_for_service()
+
+        # Arm the drone
+        #self.arm()
+
+        # Set the drone to GUIDED mode
+        #self.set_mode('GUIDED_NoGPS')
+        #self.set_mode('GUIDED')
+
+        # Takeoff to a specific altitude
+        #self.takeoff(10.0)  # Replace with desired altitude
+        self.freq = 20.0
+        self.time = 0
+        self.qx = 0
+        self.qy = 0
+        self.qz = 0
+        self.qw = 0
+        self.p = 0
+        self.q = 0
+        self.r = 0
+        self.ax = 0
+        self.ay = 0
+        self.az = 0
+        self.x0 = 0
+        self.y0 = 0
+        self.x = 0
+        self.y = 0
+        self.z = 0
+        self.vxb = 0
+        self.vyb = 0
+        self.vzb = 0
+        self.vx = 0
+        self.vy = 0
+        self.vz = 0
+        self.roll = 0
+        self.pitch = 0
+        self.yaw = 0
+
+        self.x_target = 0
+        self.y_target = 0
+        self.z_target = 0
+        self.yaw_target = 0
+
+        self.z0 = 0.0  # <<< NEW: store initial/current altitude
+
+        qos_profile = QoSProfile(depth=10)
+        qos_profile.reliability = ReliabilityPolicy.BEST_EFFORT
+        qos_profile.durability = DurabilityPolicy.VOLATILE
+
+        self.imu_subscriber = self.create_subscription(Imu, '/mavros/imu/data', self.imu_callback, qos_profile)
+        self.odom_subscriber = self.create_subscription(Odometry, '/mavros/local_position/odom', self.odom_callback, qos_profile)
+        
+        # Create CSV file and write headers
+        with open('data_actual.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['count', 'timestamp', 'qx', 'qy', 'qz', 'qw',
+                                  'p', 'q', 'r',
+                                  'ax', 'ay', 'az',
+                                  'x', 'y', 'z', 'vx', 'vy', 'vz', 'roll', 'pitch', 'yaw', 'u', 'v', 'w'])
+            
+        with open('data_control.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['count', 'timestamp', 'x', 'x_target', 'y', 'y_target', 'z', 'z_target',
+                                  'vx', 'vx_target', 'vy', 'vy_target', 'vz', 'vz_target',
+                                  'roll', 'roll_target', 'pitch', 'pitch_target', 'yaw', 'yaw_target',
+                                  'qx', 'qx_target', 'qy', 'qy_target', 'qz', 'qz_target', 'qw', 'qw_target','thrust_desired',
+                                  'vx_psi', 'vx_psi_target', 'vy_psi', 'vy_psi_target', 'vzb', 'vzb_desired','dt'])
+
+        qos_profile1 = QoSProfile(depth=10)
+        qos_profile1.reliability = ReliabilityPolicy.RELIABLE
+        qos_profile1.durability = DurabilityPolicy.VOLATILE
+        self.thrust_publisher = self.create_publisher(AttitudeTarget,
+                    "/mavros/setpoint_raw/attitude", qos_profile)
+        self.timer_ = self.create_timer(1/(self.freq),self.send_commands)
+
+        #real gains
+        self.pid_x = PIDController(Kp = 2.0,Ki = 0.0, Kd = 0.0, output_limits=(-5,5))
+        self.pid_y = PIDController(Kp = 2.0,Ki = 0.0,Kd = 0.0, output_limits=(-5,5))
+        self.pid_z = PIDController(Kp = 1.0, Ki = 0.0, Kd = 0.0, output_limits=(-3,3))
+        self.pid_yaw = PIDController(Kp = 1.0, Ki = 0.0, Kd = 0.0, output_limits=(-1,1))
+        self.pid_vx = PIDController(Kp = 15.0, Ki = 4.25, Kd = 0.25, output_limits=(-45,45))
+        self.pid_vy = PIDController(Kp = 15.0, Ki = 4.25, Kd = 0.25, output_limits=(-45,45))
+        self.pid_vz = PIDController(Kp = 0.082, Ki = 0.02, Kd = 0.02, output_limits=(-0.5,0.5))
+
+        self.pid_x.setpoint = self.x_target
+        self.pid_y.setpoint = self.y_target
+        self.pid_z.setpoint = self.z_target
+        self.pid_yaw.setpoint = self.yaw_target
+
+        self.counter = 0
+        self.last_time = self.get_clock().now()
+
+        self.get_logger().info("Sending command")
+
+    def vel_compute_control(self, dt, euler, rot_matrix, vx_desired, vy_desired, vz_desired):
+        vx_desired_psi = vx_desired*np.cos(euler[2]) + vy_desired*np.sin(euler[2])      #vx psi frame
+        vy_desired_psi = -vx_desired*np.sin(euler[2]) + vy_desired*np.cos(euler[2])     #vy_psi_frame
+        # Transform inertial-frame velocity to body-fixed frame
+        body_velocity_desired = np.transpose(rot_matrix) @ np.array([self.vx, self.vy, vz_desired])  
+        vzb_desired = body_velocity_desired[2];
+        
+        vx_actual_psi = self.vx*np.cos(euler[2]) + self.vy*np.sin(euler[2])
+        vy_actual_psi = -self.vx*np.sin(euler[2]) + self.vy*np.cos(euler[2])
+        self.pid_vx.setpoint = vx_desired_psi
+        self.pid_vy.setpoint = vy_desired_psi
+        self.pid_vz.setpoint = vzb_desired
+        
+        pitch_desired = self.pid_vx.update(vx_actual_psi,dt)
+        roll_desired = self.pid_vy.update(vy_actual_psi,dt)
+        thrust_desired = self.pid_vz.update(self.vzb,dt) + 0.20
+        thrust_desired = np.clip(thrust_desired,0.15,0.27)
+        pitch_desired = np.clip(pitch_desired,-45,45)
+        roll_desired = -np.clip(roll_desired,-45,45) 
+         
+        return roll_desired, pitch_desired, thrust_desired, \
+           vz_desired, \
+           vx_desired_psi, vy_desired_psi, vzb_desired, \
+           vx_actual_psi, vy_actual_psi
+           
+    def pos_compute_control(self, dt, euler, rot_matrix, x_target, y_target, z_target):
+        self.x_target = x_target
+        self.y_target = y_target
+        self.z_target = z_target
+        self.pid_x.setpoint = self.x_target
+        self.pid_y.setpoint = self.y_target
+        self.pid_z.setpoint = self.z_target
+        vx_desired = self.pid_x.update(self.x,dt)
+        vy_desired = self.pid_y.update(self.y,dt)
+        vz_desired = self.pid_z.update(self.z,dt)     
+        
+        vx_desired_psi = vx_desired*np.cos(euler[2]) + vy_desired*np.sin(euler[2])      #vx psi frame
+        vy_desired_psi = -vx_desired*np.sin(euler[2]) + vy_desired*np.cos(euler[2])     #vy_psi_frame
+        # Transform inertial-frame velocity to body-fixed frame
+        body_velocity_desired = np.transpose(rot_matrix) @ np.array([self.vx, self.vy, vz_desired])  
+        vzb_desired = body_velocity_desired[2];
+        
+        vx_actual_psi = self.vx*np.cos(euler[2]) + self.vy*np.sin(euler[2])
+        vy_actual_psi = -self.vx*np.sin(euler[2]) + self.vy*np.cos(euler[2])
+        self.pid_vx.setpoint = vx_desired_psi
+        self.pid_vy.setpoint = vy_desired_psi
+        self.pid_vz.setpoint = vzb_desired
+        
+        pitch_desired = self.pid_vx.update(vx_actual_psi,dt)
+        roll_desired = self.pid_vy.update(vy_actual_psi,dt)
+        thrust_desired = self.pid_vz.update(self.vzb,dt) + 0.20
+        thrust_desired = np.clip(thrust_desired,0.15,0.27)
+        pitch_desired = np.clip(pitch_desired,-45,45)
+        roll_desired = -np.clip(roll_desired,-45,45) 
+         
+        return roll_desired, pitch_desired, thrust_desired, \
+           vx_desired, vy_desired, vz_desired, \
+           vx_desired_psi, vy_desired_psi, vzb_desired, \
+           vx_actual_psi, vy_actual_psi       
+           
+    def land_compute_control(self, dt, euler, rot_matrix, x_target, y_target, vz_desired):
+        self.x_target = x_target
+        self.y_target = y_target
+        self.pid_x.setpoint = self.x_target
+        self.pid_y.setpoint = self.y_target
+        vx_desired = self.pid_x.update(self.x,dt)
+        vy_desired = self.pid_y.update(self.y,dt)
+        
+        vx_desired_psi = vx_desired*np.cos(euler[2]) + vy_desired*np.sin(euler[2])      #vx psi frame
+        vy_desired_psi = -vx_desired*np.sin(euler[2]) + vy_desired*np.cos(euler[2])     #vy_psi_frame
+        body_velocity_desired = np.transpose(rot_matrix) @ np.array([self.vx, self.vy, vz_desired])  
+        vzb_desired = body_velocity_desired[2];
+        
+        vx_actual_psi = self.vx*np.cos(euler[2]) + self.vy*np.sin(euler[2])
+        vy_actual_psi = -self.vx*np.sin(euler[2]) + self.vy*np.cos(euler[2])
+        self.pid_vx.setpoint = vx_desired_psi
+        self.pid_vy.setpoint = vy_desired_psi
+        self.pid_vz.setpoint = vzb_desired
+        
+        pitch_desired = self.pid_vx.update(vx_actual_psi,dt)
+        roll_desired = self.pid_vy.update(vy_actual_psi,dt)
+        thrust_desired = self.pid_vz.update(self.vzb,dt) + 0.20
+        thrust_desired = np.clip(thrust_desired,0.15,0.27)
+        pitch_desired = np.clip(pitch_desired,-45,45)
+        roll_desired = -np.clip(roll_desired,-45,45) 
+         
+        return roll_desired, pitch_desired, thrust_desired, \
+           vx_desired, vy_desired, vz_desired, \
+           vx_desired_psi, vy_desired_psi, vzb_desired, \
+           vx_actual_psi, vy_actual_psi       
+
+    def set_mode(self, mode):
+        req = SetMode.Request()
+        req.custom_mode = mode
+        self.get_logger().info(f'Setting mode to {mode}')
+        
+        future = self.set_mode_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        
+        if future.result().mode_sent:
+            self.get_logger().info(f'Mode set to {mode}')
+        else:
+            self.get_logger().error('Failed to set mode')
+
+    def arm(self):
+        req = CommandBool.Request()
+        req.value = True
+        self.get_logger().info('Arming the drone')
+
+        future = self.arming_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        
+        if future.result().success:
+            self.get_logger().info('Drone armed')
+        else:
+            self.get_logger().error('Failed to arm the drone')
+
+    def takeoff(self, altitude):
+        req = CommandTOL.Request()
+        req.altitude = altitude
+        req.latitude = 0.0
+        req.longitude = 0.0
+        req.min_pitch = 0.0
+        req.yaw = 0.0
+        self.get_logger().info(f'Taking off to altitude {altitude}')
+
+    def imu_callback(self, msg: Imu):
+        self.qx = msg.orientation.x
+        self.qy = msg.orientation.y
+        self.qz = msg.orientation.z
+        self.qw = msg.orientation.w
+
+    def odom_callback(self, msg: Odometry):
+        self.time = self.get_clock().now().nanoseconds
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y 
+        self.z = msg.pose.pose.position.z
+        self.vxb = msg.twist.twist.linear.x 
+        self.vyb = msg.twist.twist.linear.y 
+        self.vzb = msg.twist.twist.linear.z
+
+    def send_commands(self):
+        now = self.get_clock().now()
+        dt = (now - self.last_time).nanoseconds * 1e-9  # convert to seconds
+        self.last_time = now
+        euler = euler_from_quaternion([self.qx, self.qy, self.qz, self.qw])
+        rot_matrix_all = quaternion_matrix([self.qx, self.qy, self.qz, self.qw])
+        rot_matrix = rot_matrix_all[:3, :3]
+
+        # Transform body-frame velocity to inertial frame
+        body_velocity = np.array([self.vxb, self.vyb, self.vzb])
+        inertial_velocity = rot_matrix @ body_velocity
+        self.vx = inertial_velocity[0]
+        self.vy = inertial_velocity[1]
+        self.vz = inertial_velocity[2]
+
+        row_actual = [self.counter, self.time, self.qx, self.qy, self.qz, self.qw, self.p*180/math.pi, self.q*180/math.pi, self.r*180/math.pi, 
+                      self.ax, self.ay, self.az, 
+                      self.x, self.y, self.z, 
+                      self.vx, self.vy, self.vz, 
+                      euler[0]*180/math.pi, euler[1]*180/math.pi, euler[2]*180/math.pi, 
+                      self.vxb, self.vyb, self.vzb]
+        with open('data_actual.csv', 'a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(row_actual)
+
+        vx_desired = 0.0
+        vy_desired = 0.0
+        vz_desired = 0.0
+        thrust_desired = 0.15
+        pitch_desired = 0.0
+        roll_desired = 0.0
+        yaw_desired = 0.0
+        vx_actual_psi = 0.0
+        vy_actual_psi = 0.0
+        vzb_desired = 0.0
+        vx_desired_psi = 0.0
+        vy_desired_psi = 0.0
+
+        if self.counter < 40:
+            self.x0 = self.x
+            self.y0 = self.y
+            self.z0 = self.z  # <<< NEW: capture current altitude to hold later
+
+        if self.counter >= 40 and self.counter < 300:
+            x_target = self.x0
+            y_target = self.y0
+            z_target = self.z0 + 0.1  # <<< NEW: hold at z0 + 0.1 m
+            yaw_desired = 0
+            roll_desired, pitch_desired, thrust_desired, \
+                vx_desired, vy_desired, vz_desired, \
+                    vx_desired_psi, vy_desired_psi, vzb_desired, \
+                        vx_actual_psi, vy_actual_psi = self.pos_compute_control(dt, euler, rot_matrix, x_target, y_target, z_target)
+
+        if self.counter >= 300 and self.counter < 500:
+            x_target = self.x0
+            y_target = self.y0
+            z_target = self.z0 + 0.1  # <<< NEW: keep holding z0 + 0.1 m
+            yaw_desired =  min((self.counter-300)*180/100,180)
+            roll_desired, pitch_desired, thrust_desired, \
+                vx_desired, vy_desired, vz_desired, \
+                    vx_desired_psi, vy_desired_psi, vzb_desired, \
+                        vx_actual_psi, vy_actual_psi = self.pos_compute_control(dt, euler, rot_matrix, x_target, y_target, z_target)
+
+        if self.counter >= 500:
+            #self.set_mode('LAND')
+            print('land',self.counter) 
+            x_target = self.x0
+            y_target = self.y0
+            vz_desired = -0.2
+            yaw_desired =  min((self.counter-400)*180/100,180)
+            roll_desired, pitch_desired, thrust_desired, \
+                vx_desired, vy_desired, vz_desired, \
+                    vx_desired_psi, vy_desired_psi, vzb_desired, \
+                        vx_actual_psi, vy_actual_psi = self.land_compute_control(dt, euler, rot_matrix, x_target, y_target, vz_desired)
+
+        quaternion = quaternion_from_euler(roll_desired*math.pi/180,pitch_desired*math.pi/180,yaw_desired*math.pi/180)
+        
+        row_control = [self.counter, self.time, self.x, self.x_target, self.y, self.y_target, self.z, self.z_target, 
+                      self.vx, vx_desired, self.vy, vy_desired, self.vz, vz_desired, 
+                      euler[0]*180/math.pi, roll_desired, euler[1]*180/math.pi, pitch_desired, euler[2]*180/math.pi,  yaw_desired,
+                      self.qx, quaternion[0], self.qy, quaternion[1], self.qz, quaternion[2], self.qw, quaternion[3],thrust_desired,
+                      vx_actual_psi, vx_desired_psi, vy_actual_psi, vy_desired_psi, self.vzb, vzb_desired, dt]
+        with open('data_control.csv', 'a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(row_control)
+
+        msg = AttitudeTarget()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.thrust = thrust_desired
+        msg.orientation.x = quaternion[0]
+        msg.orientation.y = quaternion[1]
+        msg.orientation.z = quaternion[2]
+        msg.orientation.w = quaternion[3]
+        self.thrust_publisher.publish(msg)
+        self.counter += 1
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PIDControlNode()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
