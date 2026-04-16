@@ -71,3 +71,7 @@ ros2 topic hz /mavros/local_position/odom
 #mode change #20: GUIDED_NOGPS, #5: LOITER
 ros2 service call /mavros/set_mode mavros_msgs/srv/SetMode "{base_mode: 80, custom_mode: '20'}"
 
+https://ardupilot.org/dev/docs/ros-connecting.html
+rosrun mavros mavsys mode -c 0 (sets the vehicle to mode "0")
+rosrun mavros mavsafety arm (to arm the vehicle)
+
