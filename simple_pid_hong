@@ -1,0 +1,123 @@
+class PIDController:
+    def __init__(self, Kp, Ki, Kd, output_limits=(None, None)):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.output_limits = output_limits
+        
+        self.integral = 0.0
+        self.last_error = 0.0
+
+    def update(self, measurement, target, dt):
+        error = target - measurement
+        
+        # Proportional term
+        P = self.Kp * error
+        
+        # Integral term with clamping (Anti-windup)
+        self.integral += error * dt
+        I = self.Ki * self.integral
+        
+        # Derivative term
+        derivative = (error - self.last_error) / dt
+        D = self.Kd * derivative
+        
+        output = P + I + D
+        
+        # Apply output limits
+        lower, upper = self.output_limits
+        if lower is not None or upper is not None:
+            output = max(lower, min(output, upper))
+            
+        self.last_error = error
+        return output
+
+
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+        import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Imu
+from nav_msgs.msg import Odometry
+from mavros_msgs.msg import AttitudeTarget
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
+import numpy as np
+
+class BicopterPID(Node):
+    def __init__(self):
+        super().__init__('bicopter_pid')
+        
+        # 1. Initialize PIDs
+        # Roll PID: Target is 0 degrees (level)
+        self.roll_pid = PIDController(Kp=0.8, Ki=0.1, Kd=0.05, output_limits=(-0.2, 0.2))
+        # Altitude PID: Target is 1.0 meter
+        self.alt_pid = PIDController(Kp=0.5, Ki=0.05, Kd=0.1, output_limits=(-0.3, 0.3))
+
+        # 2. State Variables
+        self.current_roll = 0.0
+        self.current_alt = 0.0
+        self.last_time = self.get_clock().now()
+
+        # 3. ROS Communications
+        self.att_pub = self.create_publisher(AttitudeTarget, '/mavros/setpoint_raw/attitude', 10)
+        self.create_subscription(Imu, '/mavros/imu/data', self.imu_callback, 10)
+        self.create_subscription(Odometry, '/mavros/local_position/odom', self.odom_callback, 10)
+        
+        # Control Loop at 50Hz
+        self.create_timer(0.02, self.control_loop)
+
+    def imu_callback(self, msg):
+        # Convert Quaternion to Euler to get Roll (X-axis)
+        q = [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w]
+        roll, _, _ = euler_from_quaternion(q)
+        self.current_roll = roll
+
+    def odom_callback(self, msg):
+        self.current_alt = msg.pose.pose.position.z
+
+    def control_loop(self):
+        now = self.get_clock().now()
+        dt = (now - self.last_time).nanoseconds / 1e9
+        self.last_time = now
+        if dt <= 0: return
+
+        # --- PID CALCULATIONS ---
+        # 1. Roll Correction (Differential)
+        roll_corr = self.roll_pid.update(self.current_roll, target=0.0, dt=dt)
+        
+        # 2. Altitude Correction (Base Thrust)
+        hover_thrust = 0.5 # Assume 50% throttle is hover
+        alt_corr = self.alt_pid.update(self.current_alt, target=1.0, dt=dt)
+        base_thrust = hover_thrust + alt_corr
+
+        # --- MOTOR MIXING ---
+        # Left Motor = Base + Roll Correction
+        # Right Motor = Base - Roll Correction
+        thrust_l = np.clip(base_thrust + roll_corr, 0.1, 0.9)
+        thrust_r = np.clip(base_thrust - roll_corr, 0.1, 0.9)
+
+        # Average thrust for MAVROS (ArduPilot expects a single 0.0-1.0 value)
+        # Note: In a real bicopter, ArduPilot handles the mixing internally.
+        # If you are bypassing ArduPilot's mixer, you'd send raw PWM.
+        # Here we send the attitude target and the base thrust.
+        
+        msg = AttitudeTarget()
+        msg.header.stamp = now.to_msg()
+        # Tell ArduPilot to use the orientation we provide
+        q_target = quaternion_from_euler(0.0, 0.0, 0.0) 
+        msg.orientation.x = q_target[0]
+        msg.orientation.y = q_target[1]
+        msg.orientation.z = q_target[2]
+        msg.orientation.w = q_target[3]
+        msg.thrust = float(base_thrust)
+        
+        self.att_pub.publish(msg)
+
+def main():
+    rclpy.init()
+    node = BicopterPID()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
