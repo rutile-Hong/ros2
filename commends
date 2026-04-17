@@ -1,20 +1,29 @@
 # to see mavros/state
 gedit ~/.bashrc
-ros2 topic echo /mavros/state --once
+
 
 # start ros2 nods
 ros2 launch mavros apm.launch fcu_url:=serial:///dev/ttyUSB0:57600
+ros2 run mavros mavros_node --ros-args -p fcu_url:=/dev/ttyUSB0:57600
 
-ros2 run ardupilot_control takeoff_and_hold
+# check state
+ros2 topic echo /mavros/state --once
 
 # arming
 ros2 service call /mavros/cmd/arming mavros_msgs/srv/CommandBool "{value: true}"
 
+# Set stream rate for Attitude (6) and Position (5) to 25Hz or higher
 ros2 service call /mavros/set_stream_rate mavros_msgs/srv/StreamRate "{stream_id: 6, message_rate: 25, on_off: True}"
-
 ros2 service call /mavros/set_stream_rate mavros_msgs/srv/StreamRate "{stream_id: 0, message_rate: 0, on_off: False}"
 
+# check frequency
 ros2 topic hz /mavros/local_position/odom
+
+# change mode
+ros2 service call /mavros/set_mode mavros_msgs/srv/SetMode "{base_mode: 0, custom_mode: 'GUIDED_NOGPS'}"
+
+ros2 run ardupilot_control takeoff_and_hold
+
 
 #Stream ID
 0 – All streams
