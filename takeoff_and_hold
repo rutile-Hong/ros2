@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+import math
+import time
+
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+from mavros_msgs.msg import State
+from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
+from geometry_msgs.msg import PoseStamped
+
+
+class TakeoffAndHold(Node):
+    """
+    Sequence:
+      - Wait for MAVROS connection (/mavros/state connected)
+      - Arm
+      - Set mode GUIDED_NOGPS
+      - Issue takeoff to target altitude (relative/AGL; ArduPilot interprets as alt-above-home unless using rangefinder/terrain)
+      - Monitor altitude from /mavros/local_position/pose
+      - When reached, switch to LOITER to hold
+    """
+
+    def __init__(self):
+        super().__init__('takeoff_and_hold')
+
+        # Parameters
+        self.declare_parameter('target_alt_m', 0.30)       # 30 cm
+        self.declare_parameter('loiter_after', True)       # switch to LOITER after reaching target
+        self.declare_parameter('reach_tol_m', 0.05)        # 5 cm tolerance
+        self.declare_parameter('timeout_s', 60.0)          # overall timeout
+        self.declare_parameter('wait_ready_s', 20.0)       # how long to wait for FCU connection
+
+        self.target_alt_m = float(self.get_parameter('target_alt_m').value)
+        self.reach_tol_m = float(self.get_parameter('reach_tol_m').value)
+        self.loiter_after = bool(self.get_parameter('loiter_after').value)
+        self.timeout_s = float(self.get_parameter('timeout_s').value)
+        self.wait_ready_s = float(self.get_parameter('wait_ready_s').value)
+
+        # QoS for MAVROS state/pose (best effort often okay)
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        self.state_sub = self.create_subscription(State, '/mavros/state', self._state_cb, qos)
+        self.pose_sub = self.create_subscription(PoseStamped, '/mavros/local_position/pose', self._pose_cb, qos)
+
+        self.arming_cli = self.create_client(CommandBool, '/mavros/cmd/arming')
+        self.set_mode_cli = self.create_client(SetMode, '/mavros/set_mode')
+        self.takeoff_cli = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
+
+        self._current_state = State()
+        self._current_pose = PoseStamped()
+        self._have_pose = False
+
+        self._start_time = self.get_clock().now()
+
+        # Kick off the main routine as a timer callback so ROS2 spin stays responsive
+        self.timer = self.create_timer(0.5, self._tick)
+        self._phase = 'WAIT_FCU'
+
+        self.get_logger().info(f'Initialized. target_alt_m={self.target_alt_m:.2f}, tol={self.reach_tol_m:.2f}, loiter_after={self.loiter_after}')
+
+    def _state_cb(self, msg: State):
+        self._current_state = msg
+
+    def _pose_cb(self, msg: PoseStamped):
+        self._current_pose = msg
+        self._have_pose = True
+
+    def _service_wait(self, cli, name, sec=5.0):
+        if not cli.wait_for_service(timeout_sec=sec):
+            self.get_logger().warn(f'Service {name} not available after {sec}s')
+            return False
+        return True
+
+    def _call_arming(self, arm: bool) -> bool:
+        if not self._service_wait(self.arming_cli, 'arming', 5.0):
+            return False
+        req = CommandBool.Request()
+        req.value = arm
+        future = self.arming_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        ok = (future.result() is not None) and future.result().success
+        self.get_logger().info(f'Arm({arm}) -> {ok}')
+        return ok
+
+    def _call_set_mode(self, mode: str) -> bool:
+        if not self._service_wait(self.set_mode_cli, 'set_mode', 5.0):
+            return False
+        req = SetMode.Request()
+        req.custom_mode = mode
+        future = self.set_mode_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        ok = (future.result() is not None) and future.result().mode_sent
+        self.get_logger().info(f'SetMode({mode}) -> {ok}')
+        return ok
+
+    def _call_takeoff(self, alt_m: float) -> bool:
+        if not self._service_wait(self.takeoff_cli, 'takeoff', 5.0):
+            return False
+        req = CommandTOL.Request()
+        req.min_pitch = 0.0
+        req.yaw = float('nan')         # ignore yaw
+        req.latitude = 0.0             # unused for GUIDED takeoff from current pos
+        req.longitude = 0.0
+        req.altitude = alt_m           # ArduPilot interprets as target altitude (relative)
+        future = self.takeoff_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        ok = (future.result() is not None) and future.result().success
+        self.get_logger().info(f'Takeoff({alt_m:.2f} m) -> {ok}')
+        return ok
+
+    def _elapsed(self) -> float:
+        return (self.get_clock().now() - self._start_time).nanoseconds * 1e-9
+
+    def _tick(self):
+        # global timeout
+        if self._elapsed() > self.timeout_s:
+            self.get_logger().error('Timeout reached. Exiting node.')
+            rclpy.shutdown()
+            return
+
+        if self._phase == 'WAIT_FCU':
+            if self._current_state.connected:
+                self.get_logger().info('FCU connected.')
+                self._phase = 'ARM'
+            elif self._elapsed() > self.wait_ready_s:
+                self.get_logger().warn('Still not connected; waiting…')
+            return
+
+        if self._phase == 'ARM':
+            if not self._current_state.armed:
+                if not self._call_arming(True):
+                    self.get_logger().warn('Arming failed, retrying…')
+                    return
+            self._phase = 'GUIDED_NOGPS'
+            return
+
+        if self._phase == 'GUIDED_NOGPS':
+            if self._current_state.mode != 'GUIDED_NOGPS':
+                if not self._call_set_mode('GUIDED_NOGPS'):
+                    self.get_logger().warn('Set GUIDED_NOGPS failed, retrying…')
+                    return
+            self._phase = 'TAKEOFF'
+            return
+
+        if self._phase == 'TAKEOFF':
+            # issue takeoff once
+            if not hasattr(self, '_takeoff_sent'):
+                if not self._call_takeoff(self.target_alt_m):
+                    self.get_logger().warn('Takeoff command failed, retrying…')
+                    return
+                self._takeoff_sent = True
+                self._takeoff_cmd_time = self.get_clock().now()
+                return
+
+            # monitor altitude (local ENU z is +up for MAVROS Pose)
+            if not self._have_pose:
+                self.get_logger().warn('No local position yet…')
+                return
+
+            current_z = self._current_pose.pose.position.z
+            alt_err = self.target_alt_m - current_z
+            self.get_logger().info(f'Climbing… z={current_z:.2f} m (err {alt_err:.2f})')
+
+            if abs(alt_err) <= self.reach_tol_m:
+                self.get_logger().info('Target altitude reached.')
+                self._phase = 'HOLD'
+            return
+
+        if self._phase == 'HOLD':
+            if self.loiter_after:
+                # LOITER is the simplest way to hold position on ArduCopter
+                if self._current_state.mode != 'LOITER':
+                    if not self._call_set_mode('LOITER'):
+                        self.get_logger().warn('Set LOITER failed, retrying…')
+                        return
+                    self.get_logger().info('Now holding position in LOITER.')
+                else:
+                    self.get_logger().info('Holding position. Done.')
+                    rclpy.shutdown()
+            else:
+                # If you prefer GUIDED hold without changing mode, you could
+                # publish a constant setpoint to /mavros/setpoint_position/local here.
+                self.get_logger().info('Holding in GUIDED (no new setpoints published).')
+                rclpy.shutdown()
+            return
+
+
+def main():
+    rclpy.init()
+    node = TakeoffAndHold()
+    try:
+        rclpy.spin(node)
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
