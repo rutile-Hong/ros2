@@ -1,0 +1,153 @@
+import rclpy
+from rclpy.node import Node
+
+from geometry_msgs.msg import TwistStamped
+from nav_msgs.msg import Odometry
+
+import math
+
+
+class AltitudeController(Node):
+
+    def __init__(self):
+
+        super().__init__('bicopter_altitude_controller')
+
+        #
+        # DDS publisher
+        #
+        self.cmd_pub = self.create_publisher(
+            TwistStamped,
+            '/ap/cmd_vel',
+            10
+        )
+
+        #
+        # State subscriber
+        #
+        self.pose_sub = self.create_subscription(
+            Odometry,
+            '/ap/twist/filtered',
+            self.odom_callback,
+            10
+        )
+
+        #
+        # Timer
+        #
+        self.timer = self.create_timer(
+            0.02,
+            self.control_loop
+        )
+
+        #
+        # States
+        #
+        self.z = 0.0
+        self.vz = 0.0
+
+        #
+        # Target altitude
+        #
+        self.z_target = 1.0
+
+        #
+        # PID gains
+        #
+        self.kp = 1.5
+        self.ki = 0.2
+        self.kd = 0.4
+
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+        self.last_time = self.get_clock().now()
+
+        self.get_logger().info("Altitude controller started")
+
+    def odom_callback(self, msg):
+
+        self.z = msg.pose.pose.position.z
+        self.vz = msg.twist.twist.linear.z
+
+    def control_loop(self):
+
+        #
+        # Time step
+        #
+        now = self.get_clock().now()
+
+        dt = (now - self.last_time).nanoseconds * 1e-9
+
+        self.last_time = now
+
+        if dt <= 0.0:
+            return
+
+        #
+        # PID
+        #
+        error = self.z_target - self.z
+
+        self.integral += error * dt
+
+        derivative = (error - self.prev_error) / dt
+
+        vz_cmd = (
+            self.kp * error
+            + self.ki * self.integral
+            + self.kd * derivative
+        )
+
+        self.prev_error = error
+
+        #
+        # Limit climb rate
+        #
+        vz_cmd = max(min(vz_cmd, 0.8), -0.8)
+
+        #
+        # DDS command
+        #
+        cmd = TwistStamped()
+
+        cmd.header.stamp = now.to_msg()
+
+        #
+        # ONLY altitude control
+        #
+        cmd.twist.linear.x = 0.0
+        cmd.twist.linear.y = 0.0
+        cmd.twist.linear.z = vz_cmd
+
+        #
+        # Roll-axis test motion
+        #
+        cmd.twist.angular.x = 0.3
+
+        #
+        # No pitch/yaw
+        #
+        cmd.twist.angular.y = 0.0
+        cmd.twist.angular.z = 0.0
+
+        self.cmd_pub.publish(cmd)
+
+        self.get_logger().info(
+            f'z={self.z:.2f}  vz_cmd={vz_cmd:.2f}'
+        )
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = AltitudeController()
+
+    rclpy.spin(node)
+
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
