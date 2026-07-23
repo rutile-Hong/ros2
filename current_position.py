@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+
+from tf2_msgs.msg import TFMessage
+from geometry_msgs.msg import TransformStamped
+from rosgraph_msgs.msg import Clock
+
+
+class PositionOverride(Node):
+
+    def __init__(self):
+        super().__init__('position_override')
+
+        self.publisher = self.create_publisher(
+            TFMessage,
+            '/ap/tf',
+            10
+        )
+
+        self.clock_subscription = self.create_subscription(
+            Clock,
+            '/ap/clock',
+            self.clock_callback,
+            10
+        )
+
+        self.ap_clock_received = False
+        self.ap_time = None
+
+        # Starting local position
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.current_z = 1.0
+
+        # Position increase per update
+        # 0.01 m/update × 20 Hz = 0.2 m/s
+        self.position_step = 0.01
+        self.maximum_position = 10.0
+
+        self.timer = self.create_timer(
+            0.05,  # 20 Hz
+            self.publish_position
+        )
+
+        self.publish_counter = 0
+        self.waiting_message_printed = False
+
+        self.get_logger().info(
+            'Position override node started. Waiting for /ap/clock...'
+        )
+
+    def clock_callback(self, msg: Clock):
+
+        self.ap_time = msg.clock
+        self.ap_clock_received = True
+
+        if self.waiting_message_printed:
+            self.get_logger().info(
+                '/ap/clock received. Starting /ap/tf publication.'
+            )
+            self.waiting_message_printed = False
+
+    def publish_position(self):
+
+        if not self.ap_clock_received or self.ap_time is None:
+
+            if not self.waiting_message_printed:
+                self.get_logger().warning(
+                    'Waiting for ArduPilot time from /ap/clock...'
+                )
+                self.waiting_message_printed = True
+
+            return
+
+        # Increase x and y every 0.05 seconds
+        self.current_x = min(
+            self.current_x + self.position_step,
+            self.maximum_position
+        )
+
+        self.current_y = min(
+            self.current_y + self.position_step,
+            self.maximum_position
+        )
+
+        transform = TransformStamped()
+
+        transform.header.stamp = self.ap_time
+        transform.header.frame_id = 'odom'
+        transform.child_frame_id = 'base_link'
+
+        transform.transform.translation.x = float(self.current_x)
+        transform.transform.translation.y = float(self.current_y)
+        transform.transform.translation.z = float(self.current_z)
+
+        transform.transform.rotation.x = 0.0
+        transform.transform.rotation.y = 0.0
+        transform.transform.rotation.z = 0.0
+        transform.transform.rotation.w = 1.0
+
+        message = TFMessage()
+        message.transforms = [transform]
+
+        self.publisher.publish(message)
+
+        self.publish_counter += 1
+
+        if self.publish_counter % 20 == 0:
+            self.get_logger().info(
+                f'Position sent: '
+                f'x={self.current_x:.3f}, '
+                f'y={self.current_y:.3f}, '
+                f'z={self.current_z:.3f}, '
+                f'time={self.ap_time.sec}.'
+                f'{self.ap_time.nanosec:09d}'
+            )
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+    node = PositionOverride()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

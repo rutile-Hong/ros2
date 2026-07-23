@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+
+import csv
+import math
+import threading
+import time
+
+import numpy as np
+import rclpy
+
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+
+from sensor_msgs.msg import Imu, Joy
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from tf_transformations import euler_from_quaternion
+
+from PID_Controller import PIDController
+
+
+class PIDControlDDSNode(Node):
+    def __init__(self):
+        super().__init__("bicopter_pid_controller")
+
+        self.freq = 20.0
+        self.controller_enabled = False
+
+        self.time = 0
+
+        self.qx = 0.0
+        self.qy = 0.0
+        self.qz = 0.0
+        self.qw = 1.0
+
+        self.p = 0.0
+        self.q = 0.0
+        self.r = 0.0
+
+        self.ax = 0.0
+        self.ay = 0.0
+        self.az = 0.0
+
+        self.y0 = 0.0
+
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+
+        self.vx = 0.0
+        self.vy = 0.0
+        self.vz = 0.0
+
+        self.y_target = 0.0
+        self.z_target = 0.0
+
+        self.y_target_base = 0.0
+        self.z_target_base = 0.0
+
+        self.current_y = 0.0
+
+        self.manual_y_target = None
+        self.manual_z_target = None
+
+        self.y_step_size = 0.05
+        self.z_step_size = 0.10     # takeoff altitude
+
+        self.hover_thrust = 0.6
+        self.last_thrust = 0.0
+        self.hold_position_set = False
+
+        sensor_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        cmd_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.imu_subscriber = self.create_subscription(
+            Imu,
+            "/ap/imu/experimental/data",
+            self.imu_callback,
+            sensor_qos,
+        )
+
+        self.pose_subscriber = self.create_subscription(
+            PoseStamped,
+            "/ap/pose/filtered",
+            self.pose_callback,
+            sensor_qos,
+        )
+
+        self.twist_subscriber = self.create_subscription(
+            TwistStamped,
+            "/ap/twist/filtered",
+            self.twist_callback,
+            sensor_qos,
+        )
+
+        self.joy_publisher = self.create_publisher(
+            Joy,
+            "/ap/joy",
+            cmd_qos,
+        )
+
+        self.timer_ = self.create_timer(
+            1.0 / self.freq,
+            self.send_commands,
+        )
+
+        with open("data_actual.csv", "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                [
+                    "count", "timestamp",
+                    "qx", "qy", "qz", "qw",
+                    "p", "q", "r",
+                    "ax", "ay", "az",
+                    "x", "y", "z",
+                    "vx", "vy", "vz",
+                    "roll", "pitch", "yaw",
+                    "y_actual", "vy_actual",
+                ]
+            )
+
+        with open("data_control.csv", "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                [
+                    "count",
+                    "timestamp",
+                    "y", "y_target",
+                    "z", "z_target",
+                    "vy", "vy_target",
+                    "vz", "vz_target",
+                    "roll", "roll_target",
+                    "pitch", "yaw", "thrust",
+                    "joy_roll", "joy_pitch", "joy_throttle", "joy_yaw",
+                    "dt",
+                    ]
+            )
+
+        self.pid_y = PIDController(
+            Kp=1.0,
+            Ki=0.0,
+            Kd=0.0,
+            output_limits=(-5, 5),
+        )
+
+        self.pid_z = PIDController(
+            Kp=4.0,
+            Ki=0.0,
+            Kd=0.0,
+            output_limits=(-3, 3),
+        )
+
+        self.pid_vy = PIDController(
+            Kp=3.0,
+            Ki=0.0,
+            Kd=0.0,
+            output_limits=(-math.pi/4,math.pi/4),
+        )
+
+        self.pid_vz = PIDController(
+            Kp=0.15,
+            Ki=0.02,
+            Kd=0.02,
+            output_limits=(-0.5, 0.5),
+        )
+
+        self.pid_y.setpoint = self.y_target
+        self.pid_z.setpoint = self.z_target
+
+        self.counter = 0
+        self.last_time = self.get_clock().now()
+
+        self.max_roll_deg = 45.0
+
+        self.thrust_min = 0
+        self.thrust_max = 1
+
+        self.enable_output = True
+
+        threading.Thread(
+            target=self.keyboard_listener,
+            daemon=True,
+        ).start()
+
+        self.get_logger().info("DDS bicopter Y-Z PID controller started.")
+        self.get_logger().info("Roll angle + throttle control enabled.")
+        self.get_logger().info("Yaw compensation enabled.")
+        self.get_logger().info("Press 's' then Enter to START controller.")
+        self.get_logger().info("Press 'q' then Enter for EMERGENCY STOP.")
+
+    def keyboard_listener(self):
+        while rclpy.ok():
+            key = input().strip().lower()
+
+            if key == "s":
+                self.controller_enabled = True
+                self.counter = 0
+
+                self.manual_y_target = None
+                self.manual_z_target = None
+                self.hold_position_set = False
+
+                self.pid_y.reset()
+                self.pid_z.reset()
+                self.pid_vy.reset()
+                self.pid_vz.reset()
+
+                self.last_time = self.get_clock().now()
+
+                self.get_logger().warn("CONTROLLER ENABLED")
+
+            elif key == "a":
+                if self.manual_y_target is None:
+                    self.manual_y_target = self.current_y
+
+                self.manual_y_target += self.y_step_size
+
+                self.get_logger().info(
+                    f"Move right: target y = {self.manual_y_target:.3f} m"
+                )
+
+            elif key == "d":
+                if self.manual_y_target is None:
+                    self.manual_y_target = self.current_y
+
+                self.manual_y_target -= self.y_step_size
+                self.get_logger().info(
+                    f"Move left: target y = {self.manual_y_target:.3f} m"
+                )
+
+            elif key == "q":
+                self.controller_enabled = False
+                self.get_logger().error("EMERGENCY STOP")
+                self.send_motor_stop()
+
+    def send_motor_stop(self):
+
+        self.controller_enabled = False
+
+        thrust = self.last_thrust
+
+        dt = 0.05          # 20 Hz
+        ramp_time = 2    # seconds
+        steps = int(ramp_time / dt)
+
+        msg = Joy()
+        msg.buttons = []
+
+        for i in range(steps):
+
+            thrust = max(
+                0.0,
+                self.last_thrust * (1.0 - (i + 1) / steps)
+            )
+
+            joy_throttle = self.thrust_to_joy(thrust)
+
+            msg.header.stamp = self.get_clock().now().to_msg()
+
+            msg.axes = [
+                0.0,
+                0.0,
+                joy_throttle,
+                0.0,
+            ]
+
+            self.joy_publisher.publish(msg)
+
+            time.sleep(dt)
+
+        # Hold minimum throttle for safety
+        msg.axes = [
+            0.0,
+            0.0,
+            -1.0,
+            0.0,
+        ]
+
+        for _ in range(10):
+            msg.header.stamp = self.get_clock().now().to_msg()
+            self.joy_publisher.publish(msg)
+            time.sleep(0.02)
+
+    def imu_callback(self, msg: Imu):
+        # self.qx = msg.orientation.x
+        # self.qy = msg.orientation.y
+        # self.qz = msg.orientation.z
+        # self.qw = msg.orientation.w
+
+        self.p = msg.angular_velocity.x
+        self.q = msg.angular_velocity.y
+        self.r = msg.angular_velocity.z
+
+        self.ax = msg.linear_acceleration.x
+        self.ay = msg.linear_acceleration.y
+        self.az = msg.linear_acceleration.z
+
+    def pose_callback(self, msg: PoseStamped):
+        self.time = self.get_clock().now().nanoseconds
+
+        self.x = msg.pose.position.x
+        self.y = msg.pose.position.y
+        self.z = msg.pose.position.z
+
+        self.qx = msg.pose.orientation.x
+        self.qy = msg.pose.orientation.y
+        self.qz = msg.pose.orientation.z
+        self.qw = msg.pose.orientation.w
+
+    def twist_callback(self, msg: TwistStamped):
+        self.vx = msg.twist.linear.x
+        self.vy = msg.twist.linear.y
+        self.vz = msg.twist.linear.z
+
+    def vel_compute_control(self, dt, vy, vz, vy_target, vz_target):
+        self.pid_vy.setpoint = vy_target
+        self.pid_vz.setpoint = vz_target
+
+        roll_target = -self.pid_vy.update(vy, dt)
+        thrust = self.pid_vz.update(vz, dt) + self.hover_thrust
+
+        roll_target = np.clip(
+            roll_target,
+            -math.pi/4,
+            math.pi/4,
+        )
+
+        thrust = np.clip(
+            thrust,
+            self.thrust_min,
+            self.thrust_max,
+        )
+
+        return roll_target, thrust
+
+    def pos_compute_control(self, dt, y, z, vy, vz, y_target, z_target):
+
+        self.y_target = y_target
+        self.z_target = z_target
+
+        self.pid_y.setpoint = y_target
+        self.pid_z.setpoint = z_target
+
+        vy_desired = self.pid_y.update(y, dt)
+        vz_desired = self.pid_z.update(z, dt)
+
+        roll_target, thrust = self.vel_compute_control(
+            dt,
+            vy,
+            vz,
+            vy_desired,
+            vz_desired,
+        )
+
+        return (
+            roll_target,
+            thrust,
+            vy_desired,
+            vz_desired,
+        )
+
+    def thrust_to_joy(self, thrust):
+        thrust = float(
+            np.clip(
+                thrust,
+                self.thrust_min,
+                self.thrust_max,
+            )
+        )
+
+        return 2.0 * (thrust - self.thrust_min) / (
+            self.thrust_max - self.thrust_min
+        ) - 1.0
+
+    def publish_joy(self, roll_desired, thrust_desired):
+        joy_roll = float(
+            np.clip(
+                roll_desired / self.max_roll_deg,
+                -1.0,
+                1.0,
+            )
+        )
+
+        joy_pitch = 0.0
+        joy_yaw = 0.0
+
+        joy_throttle = float(
+            np.clip(
+                self.thrust_to_joy(thrust_desired),
+                -1.0,
+                1.0,
+            )
+        )
+
+        msg = Joy()
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        if self.enable_output:
+            msg.axes = [
+                joy_roll,
+                joy_pitch,
+                joy_throttle,
+                joy_yaw,
+            ]
+        else:
+            msg.axes = [
+                math.nan,
+                math.nan,
+                math.nan,
+                math.nan,
+            ]
+
+        msg.buttons = []
+        self.joy_publisher.publish(msg)
+
+        return (
+            joy_roll,
+            joy_pitch,
+            joy_throttle,
+            joy_yaw,
+        )
+
+    def send_commands(self):
+
+        if not self.controller_enabled:
+            return
+
+        now = self.get_clock().now()
+        dt = (now - self.last_time).nanoseconds * 1e-9
+        self.last_time = now
+
+        if dt <= 0.0:
+            return
+
+
+        # -------------------------
+        # Attitude
+        # -------------------------
+
+        euler = euler_from_quaternion(
+            [self.qx, self.qy, self.qz, self.qw]
+        )
+
+        roll = euler[0]
+        pitch = euler[1]
+        yaw = euler[2]
+
+
+        # -------------------------
+        # Yaw compensated Y motion
+        # -------------------------
+
+        y_actual = (-self.x * math.sin(yaw) + self.y * math.cos(yaw))
+        vy_actual = (-self.vx * math.sin(yaw) + self.vy * math.cos(yaw))
+        self.current_y = y_actual
+
+        # -------------------------
+        # Actual logging
+        # -------------------------
+
+        row_actual = [
+            self.counter,
+            self.time,
+
+            self.qx, self.qy, self.qz, self.qw,
+
+            self.p * 180.0 / math.pi, self.q * 180.0 / math.pi, self.r * 180.0 / math.pi,
+
+            self.ax, self.ay, self.az,
+
+            self.x, self.y, self.z,
+
+            self.vx, self.vy, self.vz,
+
+            roll * 180.0 / math.pi, pitch * 180.0 / math.pi, yaw * 180.0 / math.pi,
+
+            # yaw compensated values
+            y_actual, vy_actual,
+        ]
+
+
+        with open("data_actual.csv", "a", newline="") as file:
+            csv.writer(file).writerow(row_actual)
+
+
+
+        # -------------------------
+        # Default commands
+        # -------------------------
+
+        roll_desired = 0.0
+        thrust_desired = self.thrust_min
+
+        vy_desired = 0.0
+        vz_desired = 0.0
+
+
+        y_target = 0.0
+        z_target = 0.0
+
+
+
+        # -------------------------
+        # Save initial condition
+        # -------------------------
+
+        if self.counter >= 100 and not self.hold_position_set:
+            self.y_target_base = y_actual
+            self.z_target_base = self.z
+
+            self.manual_y_target = self.y_target_base
+            self.manual_z_target = self.z_target_base + self.z_step_size
+
+            self.hold_position_set = True
+
+            self.get_logger().info(
+                f"Hold target initialized: y={self.manual_y_target:.2f}, z={self.manual_z_target:.2f}"
+            )        
+        # -------------------------
+        # Control
+        # -------------------------
+
+        if self.hold_position_set:
+
+            y_target = self.manual_y_target
+            z_target = self.manual_z_target
+
+            (
+                roll_desired,
+                thrust_desired,
+                vy_desired,
+                vz_desired,
+            ) = self.pos_compute_control(
+                dt,
+                y_actual,
+                self.z,
+                vy_actual,
+                self.vz,
+                y_target,
+                z_target,
+            )
+
+
+
+        # -------------------------
+        # Publish command
+        # -------------------------
+
+        joy_roll, joy_pitch, joy_throttle, joy_yaw = self.publish_joy(
+            roll_desired * 180/math.pi,
+            thrust_desired,
+        )
+
+        self.last_thrust = thrust_desired
+
+
+        #print("Y target:", y_target)
+
+        # -------------------------
+        # Control logging
+        # -------------------------
+
+        row_control = [
+            self.counter,
+            self.time,
+
+            # position
+            y_actual, y_target,
+            self.z, z_target,
+
+
+            # velocity
+            vy_actual, vy_desired,
+            self.vz, vz_desired,
+
+            # attitude
+            roll * 180.0 / math.pi, roll_desired * 180.0 / math.pi,
+            pitch * 180.0 / math.pi, yaw * 180.0 / math.pi,
+
+            # command
+            thrust_desired,
+
+            joy_roll, joy_pitch, joy_throttle, joy_yaw,
+            dt,
+        ]
+
+
+        with open("data_control.csv", "a", newline="") as file:
+            csv.writer(file).writerow(row_control)
+
+
+        self.counter += 1
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = PIDControlDDSNode()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        node.get_logger().error("KeyboardInterrupt detected. Sending motor stop.")
+        node.send_motor_stop()
+
+    finally:
+        node.send_motor_stop()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
