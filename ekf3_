@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+
+import math
+from typing import Optional
+
+import rclpy
+from rclpy.node import Node
+
+from sensor_msgs.msg import Range
+from rosgraph_msgs.msg import Clock
+from tf2_msgs.msg import TFMessage
+from geometry_msgs.msg import TransformStamped
+
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+    HistoryPolicy,
+)
+
+
+class RangefinderExternalPosition(Node):
+
+    def __init__(self) -> None:
+        super().__init__('rangefinder_external_position')
+
+        # ---------------------------------------------------------
+        # Parameters
+        # ---------------------------------------------------------
+        self.declare_parameter(
+            'rangefinder_z_topic',
+            '/ap/rangefinder/range0'
+        )
+        self.declare_parameter(
+            'rangefinder_y_topic',
+            '/ap/rangefinder/range1'
+        )
+
+        self.declare_parameter('publish_topic', '/ap/tf')
+        self.declare_parameter('parent_frame', 'odom')
+        self.declare_parameter('child_frame', 'base_link')
+
+        # Change these if sensor direction is opposite.
+        self.declare_parameter('y_sign', 1.0)
+        self.declare_parameter('z_sign', 1.0)
+
+        self.declare_parameter('y_offset', 0.0)
+        self.declare_parameter('z_offset', 0.0)
+
+        self.declare_parameter('publish_rate_hz', 20.0)
+        self.declare_parameter('data_timeout_sec', 0.5)
+
+        self.rangefinder_z_topic = str(
+            self.get_parameter('rangefinder_z_topic').value
+        )
+        self.rangefinder_y_topic = str(
+            self.get_parameter('rangefinder_y_topic').value
+        )
+        self.publish_topic = str(
+            self.get_parameter('publish_topic').value
+        )
+
+        self.parent_frame = str(
+            self.get_parameter('parent_frame').value
+        )
+        self.child_frame = str(
+            self.get_parameter('child_frame').value
+        )
+
+        self.y_sign = float(self.get_parameter('y_sign').value)
+        self.z_sign = float(self.get_parameter('z_sign').value)
+
+        self.y_offset = float(self.get_parameter('y_offset').value)
+        self.z_offset = float(self.get_parameter('z_offset').value)
+
+        publish_rate_hz = float(
+            self.get_parameter('publish_rate_hz').value
+        )
+        self.data_timeout_sec = float(
+            self.get_parameter('data_timeout_sec').value
+        )
+
+        # ---------------------------------------------------------
+        # Current position
+        # ---------------------------------------------------------
+        self.current_x = 0.0
+        self.current_y: Optional[float] = None
+        self.current_z: Optional[float] = None
+
+        self.last_y_receive_time = None
+        self.last_z_receive_time = None
+
+        # ArduPilot DDS clock
+        self.ap_clock: Optional[Clock] = None
+
+        # ---------------------------------------------------------
+        # ROS interfaces
+        # ---------------------------------------------------------
+        range_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
+        self.tf_publisher = self.create_publisher(
+            TFMessage,
+            self.publish_topic,
+            10
+        )
+
+        self.z_subscription = self.create_subscription(
+            Range,
+            self.rangefinder_z_topic,
+            self.z_range_callback,
+            range_qos
+        )
+
+        self.y_subscription = self.create_subscription(
+            Range,
+            self.rangefinder_y_topic,
+            self.y_range_callback,
+            range_qos
+        )
+
+        self.clock_subscription = self.create_subscription(
+            Clock,
+            '/ap/clock',
+            self.clock_callback,
+            10
+        )
+
+        timer_period = 1.0 / max(publish_rate_hz, 1.0)
+
+        self.timer = self.create_timer(
+            timer_period,
+            self.publish_external_position
+        )
+
+        self.get_logger().info(
+            f'Z rangefinder: {self.rangefinder_z_topic}'
+        )
+        self.get_logger().info(
+            f'Y rangefinder: {self.rangefinder_y_topic}'
+        )
+        self.get_logger().info(
+            f'Publishing external position: {self.publish_topic}'
+        )
+
+    def clock_callback(self, msg: Clock) -> None:
+        """Save the latest ArduPilot clock."""
+        self.ap_clock = msg
+
+    def z_range_callback(self, msg: Range) -> None:
+        """Use rangefinder 0 as the vertical position measurement."""
+        if not self.range_is_valid(msg):
+            self.get_logger().warning(
+                f'Invalid Z range: {msg.range}',
+                throttle_duration_sec=2.0
+            )
+            return
+
+        self.current_z = (
+            self.z_sign * float(msg.range) + self.z_offset
+        )
+
+        self.last_z_receive_time = self.get_clock().now()
+
+    def y_range_callback(self, msg: Range) -> None:
+        """Use rangefinder 1 as the horizontal position measurement."""
+        if not self.range_is_valid(msg):
+            self.get_logger().warning(
+                f'Invalid Y range: {msg.range}',
+                throttle_duration_sec=2.0
+            )
+            return
+
+        self.current_y = (
+            self.y_sign * float(msg.range) + self.y_offset
+        )
+
+        self.last_y_receive_time = self.get_clock().now()
+
+    @staticmethod
+    def range_is_valid(msg: Range) -> bool:
+        """Check for finite and physically valid range data."""
+        if not math.isfinite(msg.range):
+            return False
+
+        if msg.range < msg.min_range:
+            return False
+
+        if msg.range > msg.max_range:
+            return False
+
+        return True
+
+    def data_is_recent(self, receive_time) -> bool:
+        if receive_time is None:
+            return False
+
+        age = (
+            self.get_clock().now() - receive_time
+        ).nanoseconds * 1.0e-9
+
+        return age <= self.data_timeout_sec
+
+    def publish_external_position(self) -> None:
+        if self.current_y is None or self.current_z is None:
+            return
+
+        if not self.data_is_recent(self.last_y_receive_time):
+            self.get_logger().warning(
+                'Y rangefinder data timed out',
+                throttle_duration_sec=2.0
+            )
+            return
+
+        if not self.data_is_recent(self.last_z_receive_time):
+            self.get_logger().warning(
+                'Z rangefinder data timed out',
+                throttle_duration_sec=2.0
+            )
+            return
+
+        transform = TransformStamped()
+
+        # Use ArduPilot clock when available.
+        if self.ap_clock is not None:
+            transform.header.stamp = self.ap_clock.clock
+        else:
+            transform.header.stamp = (
+                self.get_clock().now().to_msg()
+            )
+
+        transform.header.frame_id = self.parent_frame
+        transform.child_frame_id = self.child_frame
+
+        # Requested position
+        transform.transform.translation.x = 0.0
+        transform.transform.translation.y = self.current_y
+        transform.transform.translation.z = self.current_z
+
+        # Roll = 0, pitch = 0, yaw = 0
+        # Identity quaternion
+        transform.transform.rotation.x = 0.0
+        transform.transform.rotation.y = 0.0
+        transform.transform.rotation.z = 0.0
+        transform.transform.rotation.w = 1.0
+
+        tf_message = TFMessage()
+        tf_message.transforms = [transform]
+
+        self.tf_publisher.publish(tf_message)
+
+        self.get_logger().info(
+            f'Published position: '
+            f'x={self.current_x:.3f}, '
+            f'y={self.current_y:.3f}, '
+            f'z={self.current_z:.3f}, '
+            f'yaw=0.0',
+            throttle_duration_sec=1.0
+        )
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+
+    node = RangefinderExternalPosition()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
